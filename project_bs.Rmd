@@ -1,0 +1,678 @@
+---
+title: "Bayesian Statistics Project"
+author: "Edoardo Cortolezzis"
+date: "2025-09-18"
+output:
+  pdf_document: default
+  html_document: default
+header-includes:
+  - \usepackage[utf8]{inputenc}
+  - \usepackage{newunicodechar}
+  - \newunicodechar{≈}{$\approx$}
+---
+
+```{r setup, include=FALSE}
+#Markdown setup:
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = TRUE)
+set.seed(42)
+```
+
+```{r, cache = TRUE, include=FALSE}
+# Loading all libraries needed:
+packages <- c("ggwordcloud", "combinat", "leaflet", "corrplot", "Metrics", "mlmRev", "loo", "cowplot", "dplyr", "readtext", "tidytext", "stringr", "tm", "tokenizers", "quanteda", "stm", "wordcloud", "MASS", "Hmisc", "ggplot2", "mgcv", "reshape2",
+              "rstanarm", "lme4", "ggplot2", "gridExtra", "bayesplot", "broom.mixed", "tidyr", "ggtext")
+
+# Function to install and load packages
+install_and_load <- function(packages) {
+  for (pkg in packages) {
+    if (!require(pkg, character.only = TRUE)) {
+      install.packages(pkg, dependencies = TRUE)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Run the function
+install_and_load(packages)
+```
+
+# Problem C: Scores attained by students in Scotland
+
+The R package mlmRev contains the ScotsSec dataset on scores attained by Scottish secondary school students on a standardized test taken at age 16. The data include 3435 observations on 6 variables. The help file description is as follows: 
+
+• verbal: The verbal reasoning score on a test taken by the students on entry to secondary school 
+
+• attain: The score attained on the standardized test taken at age 16 
+
+• primary: A factor indicating the primary school that the student attended 
+
+• sex: A factor with levels M and F 
+
+• social: The student’s social class on a numeric scale from low to high social class 
+
+• second: A factor indicating the secondary school that the student attended
+
+After performing some explorative analyses:
+
+- Consider the binary variable attain01 which takes values 1 if attain is greater than 5 and 0 otherwise. Build a model for studying the effects of covariates on attain01 with rstan or rstanarm, taking into account the hierarchical structure of the data.
+
+- Check the model fit and comment the results.
+
+- Draw inference on school random effects. Does the primary school matter?
+
+- [optional] Propose an alternative model for the variable attain (stan fit is not required).
+
+# Data loading and EDA
+
+Let's start by loading the data, creating the `attain01` variable and transforming categorical variables into factors.
+
+```{r load}
+data("ScotsSec", package = "mlmRev")
+df <- ScotsSec %>%
+  mutate(
+    attain01 = ifelse(attain > 5, 1, 0),
+    attain01 = factor(attain01),
+    sex = factor(sex),
+    primary = factor(primary),
+    second = factor(second)
+  )
+
+# dataset structure summary
+str(df)
+```
+Now that the data has been correctly loaded, we can proceed with some exploratory data analysis.
+
+## EDA: variables distributions, missing values and outliers
+
+Distributions plots:
+
+```{r, cache = TRUE, fig.width=20, echo=FALSE}
+# 1. Outcome distribution
+ggplot(df, aes(x = factor(attain01))) +
+  geom_bar(fill = "blue") +
+  labs(x = "Attain > 5 (1=yes, 0=no)", y = "Count", title = "Distribution of attain01")
+
+# 3. Attain (original score, before binarizing)
+ggplot(df, aes(x = attain)) +
+  geom_histogram(bins = 30, fill = "green", color = "white") +
+  labs(title = "Distribution of attain score at age 16")
+
+# 2. Verbal reasoning score
+ggplot(df, aes(x = verbal)) +
+  geom_histogram(bins = 30, fill = "orange", color = "white") +
+  labs(title = "Distribution of verbal reasoning score")
+
+# 4. Sex distribution
+ggplot(df, aes(x = sex)) +
+  geom_bar(fill = "red") +
+  labs(title = "Sex distribution")
+
+# 5. Social class (numeric, low=lower class, high=higher class)
+ggplot(df, aes(x = social)) +
+  geom_histogram(bins = 30, fill = "purple", color = "white") +
+  labs(title = "Distribution of social class")
+
+# 2. Verbal reasoning score
+ggplot(df, aes(x = primary)) +
+  geom_bar(fill = "brown") +
+  labs(title = "Distribution of primary reasoning score")
+
+# 2. Verbal reasoning score
+ggplot(df, aes(x = second)) +
+  geom_bar(fill = "pink") +
+  labs(title = "Distribution of primary reasoning score")
+```
+
+
+
+As we can see:
+
+  - `attain01` and `sex` seem quite balanced;
+  
+  - `verbal` is roughly bell-shaped with some extreme values;
+  
+  - `attain` has peaks at very low and very high scores;
+  
+  - `social` is highly skewed, with most students in the lowest social class group;
+  
+  - Primary schools are numerous and uneven in size, while secondary schools are fewer and more evenly distributed.
+
+Missing Values: 
+```{r, echo=FALSE}
+# Count total missing values
+cat("Total number of missing values in df:", sum(is.na(df)))
+```
+
+
+Boxplots:
+
+```{r, cache=TRUE, echo = FALSE}
+boxplot(df$verbal, main="Boxplot of Verbal")
+boxplot(df$social, main="Boxplot of Social")
+```
+
+There are some Outliers in `verbal` that must be dealt with.
+
+```{r, cache=TRUE}
+# Calculate quartiles and IQR
+Q1 <- quantile(df$verbal, 0.25, na.rm = TRUE)
+Q3 <- quantile(df$verbal, 0.75, na.rm = TRUE)
+IQR_value <- IQR(df$verbal, na.rm = TRUE)
+
+# Define bounds
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+
+# Identify outliers
+outliers_verbal <- df[df$verbal < lower_bound | df$verbal > upper_bound, ]
+outliers_verbal
+```
+
+Since they are only 11 (out of 3k observations), we can simply remove them:
+
+```{r, cache=TRUE}
+df <- df[df$verbal >= lower_bound & df$verbal <= upper_bound, ]
+```
+
+
+## `attain01` distribution among different school groups
+
+Before exploring the models, let's take a look at `attain01`'s distribution for the differnt groups of `primary` and `second`:
+
+
+```{r stacked-bars, fig.width=9, fig.height=12, echo=FALSE}
+suppressPackageStartupMessages(library(scales))
+library(forcats)
+library(dplyr)
+library(ggplot2)
+
+plot_attain01_all <- function(data, group_var, title,
+                              fill_labels = c("0 (≤5)","1 (>5)")) {
+  gv <- rlang::ensym(group_var)
+
+  data_clean <- data %>%
+    dplyr::filter(!is.na(!!gv)) %>%
+    dplyr::mutate({{ group_var }} := forcats::fct_drop({{ group_var }}))
+
+  # order by share of ones
+  ord_df <- data_clean %>%
+    dplyr::mutate(attain01_num = as.numeric(as.character(attain01))) %>%
+    dplyr::group_by(!!gv) %>%
+    dplyr::summarise(p1 = mean(attain01_num), .groups = "drop") %>%
+    dplyr::arrange(p1)
+
+  order_levels <- ord_df %>% dplyr::pull(!!gv) %>% as.character()
+
+  props <- data_clean %>%
+    dplyr::count(!!gv, attain01, name = "n") %>%
+    dplyr::group_by(!!gv) %>%
+    dplyr::mutate(p = n / sum(n)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      attain01 = forcats::fct_recode(as.factor(attain01), `0 (≤5)` = "0", `1 (>5)` = "1"),
+      {{ group_var }} := factor(!!gv, levels = order_levels)
+    )
+
+  # more height per bar to avoid pixel-collapsing
+  n_groups <- nlevels(props[[rlang::as_name(gv)]])
+  knitr::opts_current$set(fig.height = n_groups * 0.22 + 2)
+
+  ggplot(props, aes(x = !!gv, y = p, fill = attain01)) +
+    # width = 1 removes tiny gaps; color draws thin separators so identical bars don’t visually merge
+    geom_col(width = 1, color = "white", linewidth = 0.15) +
+    coord_flip(clip = "off") +
+    geom_hline(yintercept = 0.5, linetype = 2) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      breaks = seq(0, 1, 0.25), expand = c(0, 0)
+    ) +
+    scale_fill_manual(
+      values = c("0 (≤5)" = "gray70", "1 (>5)" = "steelblue"),
+      name = "attain01", labels = fill_labels
+    ) +
+    labs(x = NULL, y = "relative proportion", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(
+      legend.position = "top",
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_text(size = 6)
+    )
+}
+
+
+# Re-plot
+p_second_all  <- plot_attain01_all(df, second,  "attain01 proportions by secondary school")
+p_primary_all <- plot_attain01_all(df, primary, "attain01 proportions by primary school")
+
+p_second_all
+p_primary_all
+
+```
+
+
+It looks like there are some major differences in `attain01`'s distribution among both primary and secondary school groups.
+
+Therefore, it may be useful to explore some **hierarchical logistic regression models**s.
+
+
+# Modeling
+
+First thing first, let's investigate the fit of different models with increased complexity and various multilevel modeling approaches.
+
+Let `attain01` be distributed as $y_i \sim \text{Bernoulli}(p_i)$, with $\text{logit}(p_i) = \eta_i$. 
+
+Individual level covariates: **verbal**, **sex** (baseline = M), **social**. 
+
+Schools: secondary $j(i)$, primary $k(i)$.
+
+**M0 (baseline):** intercept-only
+
+$$
+\eta_i = \alpha.
+$$
+
+**M1:** random intercepts for **primary** and **secondary** (no covariates)
+
+$$
+\eta_i = u_{0,\,j(i)}^{(\text{second})} + v_{0,\,k(i)}^{(\text{primary})},
+$$
+
+with $u_{j}\sim \mathcal N(0, \sigma^2_{\text{second}})$, $v_{k}\sim \mathcal N(0, \sigma^2_{\text{primary}})$.
+
+**M2:** fixed covariates only
+
+$$
+\eta_i = \alpha + \beta_1 \text{verbal}_i + \beta_2 \cdot\text{sexF}_i\ + \beta_3 \text{social}_i.
+$$
+
+**M3:** M2 + random intercepts for **primary**
+
+$$
+\eta_i = \boldsymbol{\beta}\cdot\mathbf{x}_i + v_{0,\,k(i)}.
+$$
+
+**M4:** M2 + random intercepts for **secondary**
+
+$$
+\eta_i = \boldsymbol{\beta}\cdot\mathbf{x}_i + u_{0,\,j(i)}.
+$$
+
+**M5:** M2 + (random intercepts **and** random slopes for *verbal* and *social*) by **primary**
+
+$$
+\eta_i = + \boldsymbol{\beta}\cdot\mathbf{x}_i + \big(v_{0,\,k(i)} + v_{1,\,k(i)}\,\text{verbal}_i + v_{2,\,k(i)}\,\text{social}_i\big),
+$$
+
+$\begin{pmatrix}v_{0k}\\ v_{1k}\\ v_{2k}\end{pmatrix}\sim\mathcal N(\mathbf 0,\Sigma_{\text{prim}})$.
+
+**M6:** M2 + (random intercepts **and** random slopes for *verbal* and *social*) by **secondary**
+
+$$
+\eta_i = + \boldsymbol{\beta}\cdot\mathbf{x}_i + \big(u_{0,\,j(i)} + u_{1,\,j(i)}\,\text{verbal}_i + u_{2,\,j(i)}\,\text{social}_i\big),
+$$
+
+$\begin{pmatrix}u_{0j}\\ u_{1j}\\ u_{2j}\end{pmatrix}\sim\mathcal N(\mathbf 0,\Sigma_{\text{sec}})$.
+
+**M7:** M2 + (random intercepts **and** random slopes for *verbal* and *social*) by **both** primary and secondary (cross-classified).
+
+
+**Where:**
+
+* $\alpha$ is the fixed intercept; $\boldsymbol{\beta}$ are fixed covariates;
+* $u$ and $v$ are school-specific random effects;
+* $\sigma^2$ and $\Sigma$ are variance/covariance components.
+
+
+## Fitting the models
+Let's start by fitting all the models:
+```{r fit-models, cache=TRUE, results='hide'}
+df <- df %>% mutate(attain01_num = as.integer(as.character(attain01)))
+
+# formulas (use the numeric outcome!)
+m0 <- attain01_num ~ 1
+m1 <- attain01_num ~ 1 + (1 | primary) + (1 | second)
+m2 <- attain01_num ~ verbal + sex + social
+m3 <- attain01_num ~ verbal + sex + social + (1 | primary)
+m4 <- attain01_num ~ verbal + sex + social + (1 | second)
+m5 <- attain01_num ~ verbal + sex + social + (1 + verbal + social | primary)
+m6 <- attain01_num ~ verbal + sex + social + (1 + verbal + social | second)
+m7 <- attain01_num ~ verbal + sex + social +
+                    (1 + verbal + social | primary) +
+                    (1 + verbal + social | second)
+
+# fits
+fit_m0 <- stan_glm(m0, data = df, family = binomial("logit"))
+
+fit_m1 <- stan_glmer(m1, data = df, family = binomial("logit"))
+
+fit_m2 <- stan_glm(m2, data = df, family = binomial("logit"))
+
+fit_m3 <- stan_glmer(m3, data = df, family = binomial("logit"))
+
+fit_m4 <- stan_glmer(m4, data = df, family = binomial("logit"))
+
+fit_m5 <- stan_glmer(m5, data = df, family = binomial("logit"))
+
+fit_m6 <- stan_glmer(m6, data = df, family = binomial("logit"))
+
+fit_m7 <- stan_glmer(m7, data = df, family = binomial("logit"))
+
+fits <- list(M0=fit_m0, M1=fit_m1, M2=fit_m2, M3=fit_m3, M4=fit_m4, M5=fit_m5, M6=fit_m6, M7=fit_m7)
+```
+
+## Model fit comparison (LOOIC)
+
+Now that all the models are fit, we can compare them in terms of Leave-One-Out Information Criterion (LOOIC):
+
+```{r compare, cache=TRUE, echo=FALSE}
+# PSIS-LOO for each model
+loos <- lapply(fits, loo)
+
+# tidy table
+loo_tbl <- do.call(rbind, lapply(names(loos), function(nm) {
+  l <- loos[[nm]]
+  data.frame(
+    model     = nm,
+    elpd_loo  = l$estimates["elpd_loo","Estimate"],
+    se_elpd   = l$estimates["elpd_loo","SE"],
+    p_loo     = l$estimates["p_loo","Estimate"],
+    looic     = -2 * l$estimates["elpd_loo","Estimate"],
+    k_gt_0.7  = sum(l$diagnostics$pareto_k > 0.7, na.rm = TRUE),
+    row.names = NULL
+  )
+}))
+
+# rank by LOOIC (lower is better)
+cmp <- loo_tbl %>%
+  dplyr::mutate(rank_looic = rank(looic, ties.method = "min")) %>%
+  dplyr::arrange(rank_looic)
+
+cmp
+```
+
+
+
+The best model (with lowest LOOIC) is:
+
+```{r choose-best, echo=FALSE}
+best_model_name <- cmp$model[1]
+best_fit <- fits[[best_model_name]]
+best_model_name
+```
+
+
+We can also have a visual comparison of LOOIC values across all the models:
+
+```{r plots-compare, echo=FALSE}
+# Visual LOOIC
+loo_plot_df <- cmp %>% dplyr::arrange(looic)
+ggplot(loo_plot_df, aes(x = reorder(model, looic), y = looic)) +
+  geom_point(size = 2, color = "firebrick") +
+  geom_segment(aes(xend = reorder(model, looic),
+                   y = looic - 2*se_elpd, yend = looic + 2*se_elpd),
+               color = "gray40") +
+  coord_flip() +
+  labs(x = "Model", y = "LOOIC (lower is better)",
+       title = "Model comparison by LOOIC") +
+  theme_minimal(base_size = 12)
+```
+
+
+
+
+From this overview, we can state that:
+
+- M0 (intercept-only) and M1 (random intercepts only) have much higher LOOIC (≈ 4500 and ≈ 3900), because they fit the data very poorly compared to the other models.
+
+- M2–M7 (all models including the fixed covariates verbal, sex, social) have dramatically lower LOOIC (≈ 2900–3000). This shows that those predictors explain a lot of variation in `attain01`. These models have very similar LOOIC values, hence it seems like adding random intercepts (M3, M4) or random slopes (M5–M7) doesn’t clearly outperform the simple fixed-effect model M2, at least in terms of out-of-sample predictive accuracy.
+
+Nonetheless, to investigate the random effect of `primary` and given the fact that it scored the lowest LOOIC, we'll opt for **M3**:
+
+$$
+\eta_i = \boldsymbol{\beta}\cdot\mathbf{x}_i + v_{0,\,k(i)}.
+$$
+
+
+# Commenting the fit and results of the selected model
+
+We can now explore the model fit, fixef() and ranef():
+
+```{r print-best}
+print(best_fit)
+```
+
+```{r}
+fixef(best_fit)
+```
+```{r}
+ranef(best_fit)
+```
+Hence, we can state that:
+
+- Between-primary variation is substantial, with a random-intercept SD of 0.49. This means that depending on the primary school attended, the odds of achieving attain01 = 1 can shift markedly up or down.
+
+- Averaging over the primary schools:
+
+  -- Sex: being female increases the odds by a factor of exp(0.187) ≈ 1.21, i.e. about +21% higher odds compared to males.
+
+  -- Verbal ability: each 1-point increase raises the odds by exp(0.165) ≈ 1.18, i.e. roughly an +18% increase. This is the strongest fixed predictor.
+
+  -- Social class: each 1-unit increase raises the odds by exp(0.026) ≈ 1.03, i.e. about a +3% increase. While positive, this effect is modest compared to verbal ability.
+
+Overall, verbal reasoning is the most influential fixed effect coefficient, then sex and social class also contribute positively. However there is still a meaningful between-school heterogeneity contribuiting to the the determination of `attain01`.
+
+
+We can also have a visual interpretation of the results by plotting the individual level variables againts the Pr(attain01=1):
+
+
+```{r fitted-vs-verbal, echo=FALSE, fig.width=6.5, fig.height=4.5}
+# helper to add grouping cols if the model has them
+add_group_cols <- function(newdata, df, fit) {
+  vars_in_model <- all.vars(formula(fit))
+  if ("primary" %in% vars_in_model && !"primary" %in% names(newdata)) {
+    newdata$primary <- factor(levels(df$primary)[1], levels = levels(df$primary))
+  }
+  if ("second" %in% vars_in_model && !"second" %in% names(newdata)) {
+    newdata$second  <- factor(levels(df$second)[1],  levels = levels(df$second))
+  }
+  newdata
+}
+use_re_form <- NA  # population-level predictions (exclude REs)
+
+# reference values
+ref_sex    <- levels(df$sex)[1]
+ref_social <- median(df$social, na.rm = TRUE)
+
+grid_verbal <- data.frame(
+  verbal = seq(min(df$verbal), max(df$verbal), length.out = 200),
+  sex    = ref_sex,
+  social = ref_social
+)
+grid_verbal <- add_group_cols(grid_verbal, df, best_fit)
+
+post_ep <- posterior_epred(best_fit, newdata = grid_verbal, re.form = use_re_form)
+
+# EXPLICIT names (fixes geom_ribbon error)
+summ <- data.frame(
+  mean = colMeans(post_ep),
+  lwr  = apply(post_ep, 2, quantile, probs = 0.10),
+  upr  = apply(post_ep, 2, quantile, probs = 0.90)
+)
+
+plot_df <- cbind(grid_verbal, summ)
+
+ggplot(plot_df, aes(x = verbal, y = mean)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2) +
+  geom_line(size = 1) +
+  labs(x = "Verbal reasoning score", y = "Pr(attain01 = 1)",
+       title = "Fitted logistic vs verbal") +
+  theme_minimal(base_size = 12)
+
+grid_sex <- data.frame(
+  verbal = median(df$verbal, na.rm = TRUE),
+  sex    = levels(df$sex),
+  social = median(df$social, na.rm = TRUE)
+)
+grid_sex <- add_group_cols(grid_sex, df, best_fit)
+
+post_sex <- posterior_epred(best_fit, newdata = grid_sex, re.form = use_re_form)
+
+summ_sex <- data.frame(
+  mean = colMeans(post_sex),
+  lwr  = apply(post_sex, 2, quantile, probs = 0.10),
+  upr  = apply(post_sex, 2, quantile, probs = 0.90)
+)
+
+plot_sex <- cbind(grid_sex, summ_sex)
+
+ggplot(plot_sex, aes(x = sex, y = mean)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.15) +
+  ylim(0,1) +
+  labs(x = "Sex", y = "Pr(attain01 = 1)", title = "Predicted probability by sex") +
+  theme_minimal(base_size = 12)
+
+# reference values
+ref_sex    <- levels(df$sex)[1]
+ref_verbal <- median(df$verbal, na.rm = TRUE)
+
+grid_social <- data.frame(
+  verbal = ref_verbal,
+  sex    = ref_sex,
+  social = seq(min(df$social, na.rm = TRUE),
+               max(df$social, na.rm = TRUE),
+               length.out = 200)
+)
+
+grid_social <- add_group_cols(grid_social, df, best_fit)
+
+post_ep_social <- posterior_epred(best_fit, newdata = grid_social, re.form = use_re_form)
+
+summ_social <- data.frame(
+  mean = colMeans(post_ep_social),
+  lwr  = apply(post_ep_social, 2, quantile, probs = 0.10),
+  upr  = apply(post_ep_social, 2, quantile, probs = 0.90)
+)
+
+plot_df_social <- cbind(grid_social, summ_social)
+
+ggplot(plot_df_social, aes(x = social, y = mean)) +
+  geom_line(size = 1) +
+  labs(x = "Social class (higher = higher class)",
+       y = "Pr(attain01 = 1)",
+       title = "Fitted logistic vs social") +
+  theme_minimal(base_size = 12)
+```
+
+
+# Inference on random effects and relevance of `primary` school groups
+
+Finally, we can plot the fixed and random effects **50%–95%** credibility intervals:
+
+```{r fixed-effects-intervals, echo=FALSE, fig.width=6.5, fig.height=18}
+library(bayesplot); library(ggplot2)
+
+post <- as.matrix(best_fit)
+
+# 1) fixed effects (present in rstanarm’s posterior matrix)
+fix_cols <- intersect(c("(Intercept)", "verbal", "sexF", "social"),
+                      colnames(post))
+
+# 2) primary random intercepts -> get NAMES (value=TRUE), not indices
+re_cols <- grep("^b\\[\\(Intercept\\) primary:", colnames(post),
+                value = TRUE)
+
+# optional: order primary REs by posterior mean for a cleaner caterpillar
+re_cols <- re_cols[order(colMeans(post[, re_cols, drop = FALSE]))]
+
+# 3) combined list (fixed first, then ordered REs)
+cols <- c(fix_cols, re_cols)
+
+# (optional) dynamic height
+knitr::opts_current$set(fig.height = length(cols) * 0.22 + 2)
+
+bayesplot::mcmc_intervals(
+  post[, cols, drop = FALSE],
+  prob = 0.50,
+  prob_outer = 0.95,
+  point_est = "mean"
+) +
+  labs(title = "") +
+  theme_minimal(base_size = 12)
+
+```
+
+The primary-school random intercept has an SD of 0.49 on the log-odds scale, sign of heterogeneity among primary-school groups. The above plot shows that many schools have 50% intervals separated from 0, and some (e.g. Primary 143) have 95% CIs entirely after 0, indicating a strong positive effect. With a mean of ≈ +1.2, Primary 143 alone multiplies the odds by 3.3: an effect larger than any other fixed effect. Conversely, other schools show clearly negative shifts, cutting the odds roughly in half.
+
+**Does the primary school matter?** Yes. Between-school differences are often greater than the effects of sex (+21%), verbal ability (+18% per point), or social class (+3% per unit). Moreover, including a primary random effect improved predictive performance (lowest LOOIC), showing that accounting for school-level groups is essential.
+
+# Optional: alternative model proposal for `attain`
+
+Before proposing any model, let's look at the distributions of `attain` for each primary and secondary school.
+
+```{r, cache=TRUE, echo=FALSE, fig.width=15, fig.height=8}
+# Boxplot of attain by primary school
+ggplot(df, aes(x = primary, y = attain)) +
+  geom_boxplot(outlier.size = 0.8, fill = "steelblue", alpha = 0.6) +
+  labs(
+    title = "Distribution of attain by Primary school",
+    x = "Primary school",
+    y = "Attain score"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_blank(),  # too many schools to label
+    axis.ticks.x = element_blank()
+  )
+
+# Boxplot of attain by secondary school
+ggplot(df, aes(x = second, y = attain)) +
+  geom_boxplot(outlier.size = 0.8, fill = "darkorange", alpha = 0.6) +
+  labs(
+    title = "Distribution of attain by Secondary school",
+    x = "Secondary school",
+    y = "Attain score"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_blank(),  # secondary schools fewer, but still many
+    axis.ticks.x = element_blank()
+  )
+```
+From the unaligned boxplots in these plots it's clear how a **hierarchical Poisson/NB model** could be an interesting proposal.
+
+For example, a **hierarchical NB model** with random effects at the intercepts level for both primary and secondary school could be the following:
+
+Let `attain` be distributed as counts $y_i \sim \mathrm{NegBin}(\lambda_i,\phi)$ with log link $\log \lambda_i = \eta_i$.
+We use the NB2 parameterization: $\mathbb{E}[y_i]=\lambda_i$, $\mathrm{Var}(y_i)=\lambda_i+\lambda_i^2/\phi$ (over-dispersion $\phi>0$).
+
+Covariates: **verbal**, **sex** (baseline = M), **social**.
+Schools: secondary $j(i)$, primary $k(i)$ (cross-classified).
+
+$$
+\eta_i = u^{(\text{second})}_{0,\,j(i)} + v^{(\text{primary})}_{0,\,k(i)} + \beta_1\,\text{verbal}_i 
+                 + \beta_2\,\text{sexF}_i
+                 + \beta_3\,\text{social}_i,
+$$
+
+
+**With:**
+
+$$
+u^{(\text{second})}_{0j}\sim \mathcal N\!\big(\mu_{\text{j}},\sigma^2_{\text{second}}\big),\qquad
+v^{(\text{primary})}_{0k}\sim \mathcal N\!\big(\mu_{\text{k}},\sigma^2_{\text{primary}}\big).
+$$
+
+
+$$
+\phi \sim \mathcal N^+\!(0,\gamma_\phi^2)
+$$
+
+**Where:**
+$\alpha$ is the global intercept, $\beta$’s are fixed effects at the coefficients level; $u_{0j}$ and $v_{0k}$ are school-specific random intercepts capturing residual heterogeneity at the secondary and primary levels; $\phi$ measures the amount of overdispersion.
+
+
+
+
+
